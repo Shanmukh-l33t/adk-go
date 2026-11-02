@@ -52,12 +52,6 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 				events = append(events, e)
 			}
 		}
-		responseLatestIndex := make(map[string]int)
-		for idx, ev := range events {
-			for _, resp := range utils.FunctionResponses(ev.Content) {
-				responseLatestIndex[resp.ID] = idx
-			}
-		}
 		confirmationResponses := make(map[string]toolconfirmation.ToolConfirmation)
 		for k := len(events) - 1; k >= 0; k-- {
 			event := events[k]
@@ -110,6 +104,17 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			return
 		}
 
+		responseLatestIndex := make(map[string]int)
+		firstAnswerIndex := make(map[string]int)
+		for idx, ev := range events {
+			for _, resp := range utils.FunctionResponses(ev.Content) {
+				responseLatestIndex[resp.ID] = idx
+				if _, ok := firstAnswerIndex[resp.ID]; !ok && ev.Author == "user" && resp.Name == toolconfirmation.FunctionCallName {
+					firstAnswerIndex[resp.ID] = idx
+				}
+			}
+		}
+
 		agentName := ctx.Agent().Name()
 
 		// Detect tampered confirmations before resuming any tool.
@@ -156,7 +161,6 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			}
 		}
 
-		// TODO could we skip events for >= confirmationEventIndex
 		for k := len(events) - 2; k >= 0; k-- {
 			event := events[k]
 			// Find the system generated FunctionCall event requesting the tool confirmation.
@@ -182,6 +186,7 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			// and the resulting StateDelta last-writer-wins merge all
 			// non-deterministic across runs.
 			var resumeOrder []string
+			confirmationIDByCallID := map[string]string{}
 			for _, functionCall := range calls {
 				confirmation, ok := confirmationResponses[functionCall.ID]
 				if !ok {
@@ -207,6 +212,7 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 				if !seen {
 					resumeOrder = append(resumeOrder, originalFunctionCall.ID)
 				}
+				confirmationIDByCallID[originalFunctionCall.ID] = functionCall.ID
 				toolsToResumeByFunctionCallID[originalFunctionCall.ID] = &confirmedCall{
 					confirmation: &confirmation,
 					call:         *originalFunctionCall,
@@ -217,9 +223,13 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 				continue
 			}
 
-			// Remove the tools that already have a result after their request, even if it precedes the latest user event (repeated approvals).
+			// Remove the tools that already have a result stored after the user's first
+			// answer to the confirmation (repeated approvals). The "requires confirmation"
+			// placeholder response is stored before that answer, and may sort after the
+			// request, so it must not count.
 			for callID := range toolsToResumeByFunctionCallID {
-				if idx, ok := responseLatestIndex[callID]; ok && idx > k {
+				start := max(k, firstAnswerIndex[confirmationIDByCallID[callID]])
+				if idx, ok := responseLatestIndex[callID]; ok && idx > start {
 					delete(toolsToResumeByFunctionCallID, callID)
 				}
 			}
