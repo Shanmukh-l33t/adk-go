@@ -18,6 +18,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"strings"
+	"time"
 
 	"google.golang.org/genai"
 
@@ -32,6 +34,18 @@ import (
 type confirmedCall struct {
 	confirmation *toolconfirmation.ToolConfirmation
 	call         genai.FunctionCall
+}
+
+// isConfirmationRequiredPlaceholder reports whether resp is the placeholder
+// response the flow stores for a call dispatched before its confirmation was
+// answered: the tool returns an error wrapping tool.ErrConfirmationRequired
+// (tool/tool.go, tool/functiontool) and handleFunctionCalls stores
+// {"error": err.Error()} as the call's response. Such a response is not a
+// result: the call has not run yet, and the confirmation check must not treat
+// it as one no matter where the event ordering places it.
+func isConfirmationRequiredPlaceholder(resp *genai.FunctionResponse) bool {
+	errVal, ok := resp.Response["error"].(string)
+	return ok && strings.Contains(errVal, tool.ErrConfirmationRequired.Error())
 }
 
 func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model.LLMRequest, f *Flow) iter.Seq2[*session.Event, error] {
@@ -104,13 +118,34 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 			return
 		}
 
-		responseLatestIndex := make(map[string]int)
-		firstAnswerIndex := make(map[string]int)
-		for idx, ev := range events {
+		// A stored result answers its confirmation only when it is not the
+		// "requires confirmation" placeholder and it was stored at or after the
+		// user's first answer to that confirmation (repeated approvals). The
+		// comparison is by timestamp, not by position in the event slice: the
+		// database session service breaks timestamp ties by event ID
+		// (session/database/service.go), so a result written in the same run as
+		// the approval — sharing its timestamp — can load before the approval.
+		// Positionally that result looks unanswered and the next delivery of the
+		// same approval reruns the tool. The placeholder is stored before the
+		// answer but can sort anywhere on a tie, so it is excluded by content and
+		// must never count as a result.
+		firstAnswerTime := make(map[string]time.Time)
+		latestResultTime := make(map[string]time.Time)
+		for _, ev := range events {
 			for _, resp := range utils.FunctionResponses(ev.Content) {
-				responseLatestIndex[resp.ID] = idx
-				if _, ok := firstAnswerIndex[resp.ID]; !ok && ev.Author == "user" && resp.Name == toolconfirmation.FunctionCallName {
-					firstAnswerIndex[resp.ID] = idx
+				if ev.Author == "user" && resp.Name == toolconfirmation.FunctionCallName {
+					if t, ok := firstAnswerTime[resp.ID]; !ok || ev.Timestamp.Before(t) {
+						firstAnswerTime[resp.ID] = ev.Timestamp
+					}
+					continue
+				}
+				if resp.Name == toolconfirmation.FunctionCallName || isConfirmationRequiredPlaceholder(resp) {
+					// A confirmation answer or the placeholder stored before the
+					// confirmation is answered: not a result for the call.
+					continue
+				}
+				if t, ok := latestResultTime[resp.ID]; !ok || ev.Timestamp.After(t) {
+					latestResultTime[resp.ID] = ev.Timestamp
 				}
 			}
 		}
@@ -223,13 +258,17 @@ func RequestConfirmationRequestProcessor(ctx agent.InvocationContext, req *model
 				continue
 			}
 
-			// Remove the tools that already have a result stored after the user's first
-			// answer to the confirmation (repeated approvals). The "requires confirmation"
-			// placeholder response is stored before that answer, and may sort after the
-			// request, so it must not count.
+			// Remove the tools that already have a real result stored at or
+			// after the user's first answer to the confirmation (repeated
+			// approvals). The placeholder never counts (see above), so only
+			// the timestamp comparison decides — the position of the result
+			// relative to the approval in the event slice is tie-break noise.
 			for callID := range toolsToResumeByFunctionCallID {
-				start := max(k, firstAnswerIndex[confirmationIDByCallID[callID]])
-				if idx, ok := responseLatestIndex[callID]; ok && idx > start {
+				start := events[k].Timestamp
+				if t, ok := firstAnswerTime[confirmationIDByCallID[callID]]; ok && t.After(start) {
+					start = t
+				}
+				if t, ok := latestResultTime[callID]; ok && !t.Before(start) {
 					delete(toolsToResumeByFunctionCallID, callID)
 				}
 			}
