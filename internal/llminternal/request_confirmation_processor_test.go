@@ -16,7 +16,9 @@ package llminternal_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -583,7 +585,7 @@ func TestRequestConfirmationRepeatedApprovalDoesNotRerunTool(t *testing.T) {
 		return &session.Event{Author: "testAgent", LLMResponse: model.LLMResponse{Content: &genai.Content{Parts: []*genai.Part{p}}}}
 	}
 	call := agentEvent(&genai.Part{FunctionCall: &genai.FunctionCall{Name: mockToolName, ID: callID, Args: map[string]any{"param1": "test"}}})
-	placeholder := agentEvent(&genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"error": "requires confirmation"}}})
+	placeholder := agentEvent(&genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"error": confirmationPlaceholderText()}}})
 
 	events := []*session.Event{
 		call,
@@ -1035,7 +1037,7 @@ func TestRequestConfirmationFirstApprovalPlaceholderAfterRequest(t *testing.T) {
 			"originalFunctionCall": map[string]any{"name": mockToolName, "args": map[string]any{"param1": "test"}, "id": callID},
 			"toolConfirmation":     toolconfirmation.ToolConfirmation{Hint: "h"},
 		}}}),
-		agentEvent(&genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"error": "requires confirmation"}}}),
+		agentEvent(&genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"error": confirmationPlaceholderText()}}}),
 		{Author: "user", LLMResponse: model.LLMResponse{Content: &genai.Content{Parts: []*genai.Part{{FunctionResponse: &genai.FunctionResponse{
 			Name: toolconfirmation.FunctionCallName, ID: "conf-1", Response: map[string]any{"confirmed": true},
 		}}}}}},
@@ -1060,5 +1062,207 @@ func TestRequestConfirmationFirstApprovalPlaceholderAfterRequest(t *testing.T) {
 	}
 	if !dispatched {
 		t.Errorf("first approval did not dispatch %q when the placeholder response follows the request", callID)
+	}
+}
+
+// confirmationPlaceholderText returns the response body the flow stores for a
+// call dispatched before its confirmation was answered: the tool returns an
+// error wrapping tool.ErrConfirmationRequired and handleFunctionCalls stores
+// {"error": err.Error()} as the call's response (base_flow.go). Fixtures must
+// use this shape so the skip check can tell the placeholder apart from a real
+// tool result.
+func confirmationPlaceholderText() string {
+	return fmt.Errorf("error tool %q %w", mockToolName, tool.ErrConfirmationRequired).Error()
+}
+
+// TestRequestConfirmationRepeatedApprovalTiedResult verifies that a repeated
+// approval does not rerun the tool when the tool result and the first approval
+// share a timestamp. The database session service orders timestamp ties by
+// event ID (session/database/service.go), so the result can load before the
+// approval; a position-based skip check then counts the call as unanswered and
+// runs the tool again (#2132). Both tie directions must be handled.
+func TestRequestConfirmationRepeatedApprovalTiedResult(t *testing.T) {
+	const callID = "call-1"
+	const confirmationID = "confirmation_call-1"
+
+	approvalJSON, err := json.Marshal(toolconfirmation.ToolConfirmation{Confirmed: true})
+	if err != nil {
+		t.Fatalf("error marshaling user confirmation: %v", err)
+	}
+	approval := func(ts time.Time) *session.Event {
+		return &session.Event{
+			Author:    "user",
+			Timestamp: ts,
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Parts: []*genai.Part{{FunctionResponse: &genai.FunctionResponse{
+					Name:     toolconfirmation.FunctionCallName,
+					ID:       confirmationID,
+					Response: map[string]any{"response": string(approvalJSON)},
+				}}}},
+			},
+		}
+	}
+	agentEvent := func(ts time.Time, p *genai.Part) *session.Event {
+		return &session.Event{Author: "testAgent", Timestamp: ts, LLMResponse: model.LLMResponse{Content: &genai.Content{Parts: []*genai.Part{p}}}}
+	}
+	callPart := &genai.Part{FunctionCall: &genai.FunctionCall{Name: mockToolName, ID: callID, Args: map[string]any{"param1": "test"}}}
+	placeholderPart := &genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"error": confirmationPlaceholderText()}}}
+	requestPart := &genai.Part{FunctionCall: &genai.FunctionCall{
+		Name: toolconfirmation.FunctionCallName,
+		ID:   confirmationID,
+		Args: map[string]any{
+			"originalFunctionCall": map[string]any{"name": mockToolName, "args": map[string]any{"param1": "test"}, "id": callID},
+			"toolConfirmation":     toolconfirmation.ToolConfirmation{Confirmed: false, Hint: "test hint"},
+		},
+	}}
+	resultPart := &genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"result": "done"}}}
+
+	// The first run stores the call, placeholder and request; the resumed run
+	// stores the approval and the tool result with one timestamp per run, so
+	// the result and the approval tie.
+	t1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Second)
+
+	tests := []struct {
+		name  string
+		order []*session.Event
+	}{
+		{
+			name: "result_before_approval",
+			order: []*session.Event{
+				agentEvent(t1, callPart),
+				agentEvent(t1, placeholderPart),
+				agentEvent(t1, requestPart),
+				agentEvent(t2, resultPart),
+				approval(t2),
+				approval(t2), // the same approval, delivered again
+			},
+		},
+		{
+			name: "result_after_approval",
+			order: []*session.Event{
+				agentEvent(t1, callPart),
+				agentEvent(t1, placeholderPart),
+				agentEvent(t1, requestPart),
+				approval(t2),
+				agentEvent(t2, resultPart),
+				approval(t2), // the same approval, delivered again
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agnt, tools, err := newMockLlmAgent()
+			if err != nil {
+				t.Fatalf("error creating mock llmagent: %v", err)
+			}
+			invocationContext := createInvocationContext(t, agnt, &fakeSession{events: tc.order})
+			for ev, err := range llminternal.RequestConfirmationRequestProcessor(invocationContext, &model.LLMRequest{}, &llminternal.Flow{Tools: tools}) {
+				if err != nil {
+					t.Fatalf("RequestConfirmationRequestProcessor() unexpected error: %v", err)
+				}
+				if ev == nil || ev.Content == nil {
+					continue
+				}
+				for _, part := range ev.Content.Parts {
+					if part.FunctionResponse != nil && part.FunctionResponse.ID == callID {
+						t.Errorf("repeated approval re-dispatched already answered call %q", callID)
+					}
+				}
+			}
+		})
+	}
+}
+
+// TestRequestConfirmationFirstApprovalTiedPlaceholder verifies that a first
+// approval still dispatches the call when the "requires confirmation"
+// placeholder shares the approval's timestamp and loads after it: the
+// placeholder is not a result, so it must never suppress the resume regardless
+// of where the tie-break places it.
+func TestRequestConfirmationFirstApprovalTiedPlaceholder(t *testing.T) {
+	const callID = "call-1"
+	const confirmationID = "confirmation_call-1"
+
+	agentEvent := func(ts time.Time, p *genai.Part) *session.Event {
+		return &session.Event{Author: "testAgent", Timestamp: ts, LLMResponse: model.LLMResponse{Content: &genai.Content{Parts: []*genai.Part{p}}}}
+	}
+	callPart := &genai.Part{FunctionCall: &genai.FunctionCall{Name: mockToolName, ID: callID, Args: map[string]any{"param1": "test"}}}
+	placeholderPart := &genai.Part{FunctionResponse: &genai.FunctionResponse{Name: mockToolName, ID: callID, Response: map[string]any{"error": confirmationPlaceholderText()}}}
+	requestPart := &genai.Part{FunctionCall: &genai.FunctionCall{
+		Name: toolconfirmation.FunctionCallName,
+		ID:   confirmationID,
+		Args: map[string]any{
+			"originalFunctionCall": map[string]any{"name": mockToolName, "args": map[string]any{"param1": "test"}, "id": callID},
+			"toolConfirmation":     toolconfirmation.ToolConfirmation{Confirmed: false, Hint: "test hint"},
+		},
+	}}
+	approval := func(ts time.Time) *session.Event {
+		return &session.Event{
+			Author:    "user",
+			Timestamp: ts,
+			LLMResponse: model.LLMResponse{
+				Content: &genai.Content{Parts: []*genai.Part{{FunctionResponse: &genai.FunctionResponse{
+					Name:     toolconfirmation.FunctionCallName,
+					ID:       confirmationID,
+					Response: map[string]any{"confirmed": true},
+				}}}},
+			},
+		}
+	}
+
+	// The first run stores the call and request; the placeholder and the
+	// approval tie on the second run's timestamp (coarse clock or fixed time),
+	// so either can load first.
+	t1 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	t2 := t1.Add(time.Second)
+
+	tests := []struct {
+		name  string
+		order []*session.Event
+	}{
+		{
+			name: "placeholder_before_approval",
+			order: []*session.Event{
+				agentEvent(t1, callPart),
+				agentEvent(t1, requestPart),
+				agentEvent(t2, placeholderPart),
+				approval(t2),
+			},
+		},
+		{
+			name: "placeholder_after_approval",
+			order: []*session.Event{
+				agentEvent(t1, callPart),
+				agentEvent(t1, requestPart),
+				approval(t2),
+				agentEvent(t2, placeholderPart),
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			agnt, tools, err := newMockLlmAgent()
+			if err != nil {
+				t.Fatalf("error creating mock llmagent: %v", err)
+			}
+			invocationContext := createInvocationContext(t, agnt, &fakeSession{events: tc.order})
+			dispatched := false
+			for ev, err := range llminternal.RequestConfirmationRequestProcessor(invocationContext, &model.LLMRequest{}, &llminternal.Flow{Tools: tools}) {
+				if err != nil {
+					t.Fatalf("RequestConfirmationRequestProcessor() unexpected error: %v", err)
+				}
+				if ev == nil || ev.Content == nil {
+					continue
+				}
+				for _, part := range ev.Content.Parts {
+					if part.FunctionResponse != nil && part.FunctionResponse.ID == callID {
+						dispatched = true
+					}
+				}
+			}
+			if !dispatched {
+				t.Errorf("first approval did not dispatch %q when the placeholder shares the approval's timestamp", callID)
+			}
+		})
 	}
 }
